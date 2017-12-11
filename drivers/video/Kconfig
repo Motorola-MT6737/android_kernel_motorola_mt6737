@@ -17,6 +17,10 @@ config SH_LCD_MIPI_DSI
 
 source "drivers/char/agp/Kconfig"
 
+menu "ARM GPU Configuration"
+source "drivers/gpu/arm/Kconfig"
+endmenu
+
 source "drivers/gpu/vga/Kconfig"
 
 source "drivers/gpu/host1x/Kconfig"
@@ -31,6 +35,7 @@ source "drivers/video/fbdev/Kconfig"
 endmenu
 
 source "drivers/video/backlight/Kconfig"
+source "drivers/video/adf/Kconfig"
 
 config VGASTATE
        tristate
@@ -38,6 +43,21 @@ config VGASTATE
 
 config VIDEOMODE_HELPERS
 	bool
+
+# add by longcheer yufangfang for cabc
+config LCT_CABC_MODE_SUPPORT
+	bool "LCT_CABC_MODE_SUPPORT"
+#yufangfang add end
+
+# add by longhceer yufangfang for hbm
+config LCT_HBM_SUPPORT
+	bool "LCT_HBM_SUPPORT"
+# yufangfang add end
+
+# add by longhceer yufangfang for esd check
+config LCT_ESD_CHECK_MULTI_REG
+	bool "LCT_ESD_CHECK_MULTI_REG"
+# yufangfang add end
 
 config HDMI
 	bool

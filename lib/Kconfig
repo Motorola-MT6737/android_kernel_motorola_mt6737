@@ -225,6 +225,10 @@ config LZ4HC_COMPRESS
 config LZ4_DECOMPRESS
 	tristate
 
+config LZ4K
+	bool "LZ4K compression"
+	default n
+
 source "lib/xz/Kconfig"
 
 #
@@ -517,5 +521,8 @@ source "lib/fonts/Kconfig"
 
 config ARCH_HAS_SG_CHAIN
 	def_bool n
+
+config WBT
+    bool
 
 endmenu

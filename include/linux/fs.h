@@ -184,6 +184,9 @@ typedef void (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
  * WRITE_FLUSH_FUA	Combination of WRITE_FLUSH and FUA. The IO is preceded
  *			by a cache flush and data is guaranteed to be on
  *			non-volatile media on completion.
+ * WRITE_BG		Background write. This is for background activity like
+ *			the periodic flush and background threshold writeback
+ *
  *
  */
 #define RW_MASK			REQ_WRITE
@@ -199,7 +202,7 @@ typedef void (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
 #define WRITE_FLUSH		(WRITE | REQ_SYNC | REQ_NOIDLE | REQ_FLUSH)
 #define WRITE_FUA		(WRITE | REQ_SYNC | REQ_NOIDLE | REQ_FUA)
 #define WRITE_FLUSH_FUA		(WRITE | REQ_SYNC | REQ_NOIDLE | REQ_FLUSH | REQ_FUA)
-
+#define WRITE_BG		(WRITE | REQ_NOIDLE | REQ_BG)
 /*
  * Attribute flags.  These should be or-ed together to figure out what
  * has been changed!
@@ -1610,6 +1613,8 @@ struct super_operations {
 #define S_IMA		1024	/* Inode has an associated IMA struct */
 #define S_AUTOMOUNT	2048	/* Automount/referral quasi-directory */
 #define S_NOSEC		4096	/* no suid or xattr security attributes */
+#define S_ATOMIC_COPY	8192	/* Pages mapped with this inode need to be
+				   atomically copied (gem) */
 
 /*
  * Note that nosuid etc flags are inode-specific: setting some file-system
@@ -2119,6 +2124,13 @@ extern struct super_block *freeze_bdev(struct block_device *);
 extern void emergency_thaw_all(void);
 extern int thaw_bdev(struct block_device *bdev, struct super_block *sb);
 extern int fsync_bdev(struct block_device *);
+extern int fsync_super(struct super_block *);
+extern int fsync_no_super(struct block_device *);
+#define FS_FREEZER_FUSE 1
+#define FS_FREEZER_NORMAL 2
+#define FS_FREEZER_ALL (FS_FREEZER_FUSE | FS_FREEZER_NORMAL)
+void freeze_filesystems(int which);
+void thaw_filesystems(int which);
 extern int sb_is_blkdev_sb(struct super_block *sb);
 #else
 static inline void bd_forget(struct inode *inode) {}
