@@ -221,7 +221,7 @@
 
 #include "gadget_chips.h"
 #include "configfs.h"
-#include "usb_boost.h"
+
 
 /*------------------------------------------------------------------------*/
 
@@ -251,6 +251,20 @@ static struct usb_gadget_strings *fsg_strings_array[] = {
 
 /*-------------------------------------------------------------------------*/
 
+/*
+ * If USB mass storage vfs operation is stuck for more than 10 sec
+ * host will initiate the reset. Configure the timer with 9 sec to print
+ * the error message before host is intiating the resume on it.
+ */
+#define MSC_VFS_TIMER_PERIOD_MS	9000
+static int msc_vfs_timer_period_ms = MSC_VFS_TIMER_PERIOD_MS;
+module_param(msc_vfs_timer_period_ms, int, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(msc_vfs_timer_period_ms, "Set period for MSC VFS timer");
+
+static int write_error_after_csw_sent;
+static int must_report_residue;
+static int csw_sent;
+
 struct fsg_dev;
 struct fsg_common;
 
@@ -275,7 +289,6 @@ struct fsg_common {
 	struct fsg_buffhd	*next_buffhd_to_drain;
 	struct fsg_buffhd	*buffhds;
 	unsigned int		fsg_num_buffers;
-
 	int			cmnd_size;
 	u8			cmnd[MAX_COMMAND_SIZE];
 
@@ -312,17 +325,11 @@ struct fsg_common {
 	/* Gadget's private data. */
 	void			*private_data;
 
-	/*
-	 * Vendor (8 chars), product (16 chars), release (4
-	 * hexadecimal digits) and NUL byte
-	 */
-
 	char inquiry_string[INQUIRY_MAX_LEN];
 	/* LUN name for sysfs purpose */
 	char name[FSG_MAX_LUNS][LUN_NAME_LEN];
-
 	struct kref		ref;
-	u8 bicr;
+	struct timer_list	vfs_timer;
 };
 
 struct fsg_dev {
@@ -342,6 +349,26 @@ struct fsg_dev {
 	struct usb_ep		*bulk_out;
 };
 
+static void msc_usb_vfs_timer_func(unsigned long data)
+{
+	struct fsg_common *common = (struct fsg_common *) data;
+
+	switch (common->data_dir) {
+	case DATA_DIR_FROM_HOST:
+		dev_err(&common->curlun->dev,
+				"usb mass storage stuck in vfs_write\n");
+		break;
+	case DATA_DIR_TO_HOST:
+		dev_err(&common->curlun->dev,
+				"usb mass storage stuck in vfs_read\n");
+		break;
+	default:
+		dev_err(&common->curlun->dev,
+				"usb mass storage stuck in vfs_sync\n");
+		break;
+	}
+}
+
 static inline int __fsg_is_set(struct fsg_common *common,
 			       const char *func, unsigned line)
 {
@@ -360,6 +387,7 @@ static inline struct fsg_dev *fsg_from_func(struct usb_function *f)
 }
 
 typedef void (*fsg_routine_t)(struct fsg_dev *);
+static int send_status(struct fsg_common *common);
 
 static int exception_in_progress(struct fsg_common *common)
 {
@@ -377,9 +405,6 @@ static void set_bulk_out_req_length(struct fsg_common *common,
 	if (rem > 0)
 		length += common->bulk_out_maxpacket - rem;
 	bh->outreq->length = length;
-
-	/* used by usb20 */
-	bh->outreq->short_not_ok = 1;
 }
 
 
@@ -550,14 +575,8 @@ static int fsg_setup(struct usb_function *f,
 				w_length != 1)
 			return -EDOM;
 		VDBG(fsg, "get max LUN\n");
-		if (fsg->common->bicr) {
-			/*When enable bicr, only share ONE LUN.*/
-			*(u8 *)req->buf = 0;
-		} else {
-			*(u8 *)req->buf = fsg->common->nluns - 1;
-		}
+		*(u8 *)req->buf = fsg->common->nluns - 1;
 
-		INFO(fsg, "get max LUN = %d\n", *(u8 *)req->buf);
 		/* Respond with data/status */
 		req->length = min((u16)1, w_length);
 		return ep0_queue(fsg->common);
@@ -667,7 +686,7 @@ static int do_read(struct fsg_common *common)
 	loff_t			file_offset, file_offset_tmp;
 	unsigned int		amount;
 	ssize_t			nread;
-
+	ktime_t			start, diff;
 	/*
 	 * Get the starting Logical Block Address and check that it's
 	 * not too big.
@@ -740,13 +759,19 @@ static int do_read(struct fsg_common *common)
 		}
 
 		/* Perform the read */
-		usb_boost();
 		file_offset_tmp = file_offset;
+		start = ktime_get();
+		mod_timer(&common->vfs_timer, jiffies +
+			msecs_to_jiffies(msc_vfs_timer_period_ms));
 		nread = vfs_read(curlun->filp,
 				 (char __user *)bh->buf,
 				 amount, &file_offset_tmp);
+		del_timer_sync(&common->vfs_timer);
 		VLDBG(curlun, "file read %u @ %llu -> %d\n", amount,
 		      (unsigned long long)file_offset, (int)nread);
+		diff = ktime_sub(ktime_get(), start);
+		curlun->perf.rbytes += nread;
+		curlun->perf.rtime = ktime_add(curlun->perf.rtime, diff);
 		if (signal_pending(current))
 			return -EINTR;
 
@@ -808,7 +833,8 @@ static int do_write(struct fsg_common *common)
 	loff_t			usb_offset, file_offset, file_offset_tmp;
 	unsigned int		amount;
 	ssize_t			nwritten;
-	int			rc;
+	ktime_t			start, diff;
+	int			rc, i;
 
 	if (curlun->ro) {
 		curlun->sense_data = SS_WRITE_PROTECTED;
@@ -902,7 +928,13 @@ static int do_write(struct fsg_common *common)
 		bh = common->next_buffhd_to_drain;
 		if (bh->state == BUF_STATE_EMPTY && !get_some_more)
 			break;			/* We stopped early */
-		if (bh->state == BUF_STATE_FULL) {
+		/*
+		 * If the csw packet is already submmitted to the hardware,
+		 * by marking the state of buffer as full, then by checking
+		 * the residue, we make sure that this csw packet is not
+		 * written on to the storage media.
+		 */
+		if (bh->state == BUF_STATE_FULL && common->residue) {
 			smp_rmb();
 			common->next_buffhd_to_drain = bh->next;
 			bh->state = BUF_STATE_EMPTY;
@@ -936,13 +968,20 @@ static int do_write(struct fsg_common *common)
 				goto empty_write;
 
 			/* Perform the write */
-			usb_boost();
 			file_offset_tmp = file_offset;
+			start = ktime_get();
+			mod_timer(&common->vfs_timer, jiffies +
+				msecs_to_jiffies(msc_vfs_timer_period_ms));
 			nwritten = vfs_write(curlun->filp,
 					     (char __user *)bh->buf,
 					     amount, &file_offset_tmp);
+			del_timer_sync(&common->vfs_timer);
 			VLDBG(curlun, "file write %u @ %llu -> %d\n", amount,
 			      (unsigned long long)file_offset, (int)nwritten);
+			diff = ktime_sub(ktime_get(), start);
+			curlun->perf.wbytes += nwritten;
+			curlun->perf.wtime =
+					ktime_add(curlun->perf.wtime, diff);
 			if (signal_pending(current))
 				return -EINTR;		/* Interrupted! */
 
@@ -965,9 +1004,42 @@ static int do_write(struct fsg_common *common)
 				curlun->sense_data_info =
 					file_offset >> curlun->blkbits;
 				curlun->info_valid = 1;
+				write_error_after_csw_sent = 1;
+				goto write_error;
 				break;
 			}
+write_error:
+			if ((nwritten == amount) && !csw_sent) {
+				if (write_error_after_csw_sent)
+					break;
 
+				/*
+				 * If residue still exists and nothing left to
+				 * write, device must send correct residue to
+				 * host in this case.
+				 */
+				if (!amount_left_to_write && common->residue) {
+					must_report_residue = 1;
+					break;
+				}
+				/*
+				 * Check if any of the buffer is in the
+				 * busy state, if any buffer is in busy state,
+				 * means the complete data is not received
+				 * yet from the host. So there is no point in
+				 * csw right away without the complete data.
+				 */
+				for (i = 0; i < common->fsg_num_buffers; i++) {
+					if (common->buffhds[i].state ==
+							BUF_STATE_BUSY)
+						break;
+				}
+				if (!amount_left_to_req &&
+						i == common->fsg_num_buffers) {
+					csw_sent = 1;
+					send_status(common);
+				}
+			}
  empty_write:
 			/* Did the host decide to stop early? */
 			if (bh->outreq->actual < bh->bulk_out_intended_length) {
@@ -996,9 +1068,12 @@ static int do_synchronize_cache(struct fsg_common *common)
 
 	/* We ignore the requested LBA and write out all file's
 	 * dirty data buffers. */
+	mod_timer(&common->vfs_timer, jiffies +
+		msecs_to_jiffies(msc_vfs_timer_period_ms));
 	rc = fsg_lun_fsync_sub(curlun);
 	if (rc)
 		curlun->sense_data = SS_WRITE_ERROR;
+	del_timer_sync(&common->vfs_timer);
 	return 0;
 }
 
@@ -1054,7 +1129,10 @@ static int do_verify(struct fsg_common *common)
 	file_offset = ((loff_t) lba) << curlun->blkbits;
 
 	/* Write out all the dirty buffers before invalidating them */
+	mod_timer(&common->vfs_timer, jiffies +
+			msecs_to_jiffies(msc_vfs_timer_period_ms));
 	fsg_lun_fsync_sub(curlun);
+	del_timer_sync(&common->vfs_timer);
 	if (signal_pending(current))
 		return -EINTR;
 
@@ -1084,9 +1162,12 @@ static int do_verify(struct fsg_common *common)
 
 		/* Perform the read */
 		file_offset_tmp = file_offset;
+		mod_timer(&common->vfs_timer, jiffies +
+				msecs_to_jiffies(msc_vfs_timer_period_ms));
 		nread = vfs_read(curlun->filp,
 				(char __user *) bh->buf,
 				amount, &file_offset_tmp);
+		del_timer_sync(&common->vfs_timer);
 		VLDBG(curlun, "file read %u @ %llu -> %d\n", amount,
 				(unsigned long long) file_offset,
 				(int) nread);
@@ -1417,9 +1498,12 @@ static int do_prevent_allow(struct fsg_common *common)
 		return -EINVAL;
 	}
 
-	/* don't flush if nofua is set */
-	if (!curlun->nofua && curlun->prevent_medium_removal && !prevent)
+	if (!curlun->nofua && curlun->prevent_medium_removal && !prevent) {
+		mod_timer(&common->vfs_timer, jiffies +
+			msecs_to_jiffies(msc_vfs_timer_period_ms));
 		fsg_lun_fsync_sub(curlun);
+		del_timer_sync(&common->vfs_timer);
+	}
 	curlun->prevent_medium_removal = prevent;
 	return 0;
 }
@@ -1686,7 +1770,7 @@ static int send_status(struct fsg_common *common)
 		sd = SS_LOGICAL_UNIT_NOT_SUPPORTED;
 
 	if (common->phase_error) {
-		ERROR(common, "sending phase-error status\n");
+		DBG(common, "sending phase-error status\n");
 		status = US_BULK_STAT_PHASE;
 		sd = SS_INVALID_COMMAND;
 	} else if (sd != SS_NO_SENSE) {
@@ -1703,6 +1787,17 @@ static int send_status(struct fsg_common *common)
 	csw->Signature = cpu_to_le32(US_BULK_CS_SIGN);
 	csw->Tag = common->tag;
 	csw->Residue = cpu_to_le32(common->residue);
+	/*
+	 * Since csw is being sent early, before
+	 * writing on to storage media, need to set
+	 * residue to zero,assuming that write will succeed.
+	 */
+	if (write_error_after_csw_sent || must_report_residue) {
+		write_error_after_csw_sent = 0;
+		must_report_residue = 0;
+	}
+	else
+		csw->Residue = 0;
 	csw->Status = status;
 
 	bh->inreq->length = US_BULK_CS_WRAP_LEN;
@@ -1752,8 +1847,6 @@ static int check_command(struct fsg_common *common, int cmnd_size,
 		 * Carry out the command, but only transfer as much as
 		 * we are allowed.
 		 */
-		ERROR(common, "PHASE ERROR: data_size(%d) < data_size_from_cmnd(%d)\n",
-				common->data_size, common->data_size_from_cmnd);
 		common->data_size_from_cmnd = common->data_size;
 		common->phase_error = 1;
 	}
@@ -1762,8 +1855,6 @@ static int check_command(struct fsg_common *common, int cmnd_size,
 
 	/* Conflicting data directions is a phase error */
 	if (common->data_dir != data_dir && common->data_size_from_cmnd > 0) {
-		ERROR(common, "PHASE ERROR: conflict data dir(%d,%d),data_size_from_cmnd(%d)\n",
-				common->data_dir, data_dir, common->data_size_from_cmnd);
 		common->phase_error = 1;
 		return -EINVAL;
 	}
@@ -2315,18 +2406,6 @@ reset:
 			}
 		}
 
-		/* Disable the endpoints */
-		if (fsg->bulk_in_enabled) {
-			usb_ep_disable(fsg->bulk_in);
-			fsg->bulk_in->driver_data = NULL;
-			fsg->bulk_in_enabled = 0;
-		}
-		if (fsg->bulk_out_enabled) {
-			usb_ep_disable(fsg->bulk_out);
-			fsg->bulk_out->driver_data = NULL;
-			fsg->bulk_out_enabled = 0;
-		}
-
 		common->fsg = NULL;
 		wake_up(&common->fsg_wait);
 	}
@@ -2337,28 +2416,6 @@ reset:
 
 	common->fsg = new_fsg;
 	fsg = common->fsg;
-
-	/* Enable the endpoints */
-	rc = config_ep_by_speed(common->gadget, &(fsg->function), fsg->bulk_in);
-	if (rc)
-		goto reset;
-	rc = usb_ep_enable(fsg->bulk_in);
-	if (rc)
-		goto reset;
-	fsg->bulk_in->driver_data = common;
-	fsg->bulk_in_enabled = 1;
-
-	rc = config_ep_by_speed(common->gadget, &(fsg->function),
-				fsg->bulk_out);
-	if (rc)
-		goto reset;
-	rc = usb_ep_enable(fsg->bulk_out);
-	if (rc)
-		goto reset;
-	fsg->bulk_out->driver_data = common;
-	fsg->bulk_out_enabled = 1;
-	common->bulk_out_maxpacket = usb_endpoint_maxp(fsg->bulk_out->desc);
-	clear_bit(IGNORE_BULK_OUT, &fsg->atomic_bitflags);
 
 	/* Allocate the requests */
 	for (i = 0; i < common->fsg_num_buffers; ++i) {
@@ -2390,14 +2447,63 @@ reset:
 static int fsg_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
 {
 	struct fsg_dev *fsg = fsg_from_func(f);
+	struct fsg_common *common = fsg->common;
+	int rc;
+
+	/* Enable the endpoints */
+	rc = config_ep_by_speed(common->gadget, &(fsg->function), fsg->bulk_in);
+	if (rc)
+		goto err_exit;
+	rc = usb_ep_enable(fsg->bulk_in);
+	if (rc)
+		goto err_exit;
+	fsg->bulk_in->driver_data = common;
+	fsg->bulk_in_enabled = 1;
+
+	rc = config_ep_by_speed(common->gadget, &(fsg->function),
+				fsg->bulk_out);
+	if (rc)
+		goto reset_bulk_int;
+
+	rc = usb_ep_enable(fsg->bulk_out);
+	if (rc)
+		goto reset_bulk_int;
+
+	fsg->bulk_out->driver_data = common;
+	fsg->bulk_out_enabled = 1;
+	common->bulk_out_maxpacket = usb_endpoint_maxp(fsg->bulk_out->desc);
+	clear_bit(IGNORE_BULK_OUT, &fsg->atomic_bitflags);
+	csw_sent = 0;
+	write_error_after_csw_sent = 0;
+
 	fsg->common->new_fsg = fsg;
 	raise_exception(fsg->common, FSG_STATE_CONFIG_CHANGE);
 	return USB_GADGET_DELAYED_STATUS;
+
+reset_bulk_int:
+	usb_ep_disable(fsg->bulk_in);
+	fsg->bulk_in_enabled = 0;
+err_exit:
+	return rc;
 }
 
 static void fsg_disable(struct usb_function *f)
 {
 	struct fsg_dev *fsg = fsg_from_func(f);
+
+	/* Disable the endpoints */
+	if (fsg->bulk_in_enabled) {
+		usb_ep_disable(fsg->bulk_in);
+		fsg->bulk_in->driver_data = NULL;
+		fsg->bulk_in_enabled = 0;
+	}
+
+	if (fsg->bulk_out_enabled) {
+		usb_ep_disable(fsg->bulk_out);
+		fsg->bulk_out->driver_data = NULL;
+		fsg->bulk_out_enabled = 0;
+	}
+
 	fsg->common->new_fsg = NULL;
 	raise_exception(fsg->common, FSG_STATE_CONFIG_CHANGE);
 }
@@ -2523,9 +2629,13 @@ static void handle_exception(struct fsg_common *common)
 				       &common->fsg->atomic_bitflags))
 			usb_ep_clear_halt(common->fsg->bulk_in);
 
-		if (common->ep0_req_tag == exception_req_tag)
-			ep0_queue(common);	/* Complete the status stage */
-
+		if (common->ep0_req_tag == exception_req_tag) {
+			/* Complete the status stage */
+			if (common->cdev)
+				usb_composite_setup_continue(common->cdev);
+			else
+				ep0_queue(common);
+		}
 		/*
 		 * Technically this should go here, but it would only be
 		 * a waste of time.  Ditto for the INTERFACE_CHANGE and
@@ -2615,6 +2725,15 @@ static int fsg_main_thread(void *common_)
 			common->state = FSG_STATE_STATUS_PHASE;
 		spin_unlock_irq(&common->lock);
 
+		/*
+		 * Since status is already sent for write scsi command,
+		 * need to skip sending status once again if it is a
+		 * write scsi command.
+		 */
+		if (csw_sent) {
+			csw_sent = 0;
+			continue;
+		}
 		if (send_status(common))
 			continue;
 
@@ -2705,6 +2824,7 @@ static ssize_t file_store(struct device *dev, struct device_attribute *attr,
 static DEVICE_ATTR_RW(ro);
 static DEVICE_ATTR_RW(nofua);
 static DEVICE_ATTR_RW(file);
+static DEVICE_ATTR(perf, 0644, fsg_show_perf, fsg_store_perf);
 
 static struct device_attribute dev_attr_ro_cdrom = __ATTR_RO(ro);
 static struct device_attribute dev_attr_file_nonremovable = __ATTR_RO(file);
@@ -2783,6 +2903,10 @@ int fsg_common_set_num_buffers(struct fsg_common *common, unsigned int n)
 {
 	struct fsg_buffhd *bh, *buffhds;
 	int i, rc;
+	size_t extra_buf_alloc = 0;
+
+	if (common->gadget)
+		extra_buf_alloc = common->gadget->extra_buf_alloc;
 
 	rc = fsg_num_buffers_validate(n);
 	if (rc != 0)
@@ -2800,11 +2924,8 @@ int fsg_common_set_num_buffers(struct fsg_common *common, unsigned int n)
 		bh->next = bh + 1;
 		++bh;
 buffhds_first_it:
-#if defined(CONFIG_64BIT) && defined(CONFIG_MTK_LM_MODE)
-		bh->buf = kmalloc(FSG_BUFLEN, GFP_KERNEL | GFP_DMA);
-#else
-		bh->buf = kmalloc(FSG_BUFLEN, GFP_KERNEL);
-#endif
+		bh->buf = kmalloc(FSG_BUFLEN + extra_buf_alloc,
+				GFP_KERNEL);
 		if (unlikely(!bh->buf))
 			goto error_release;
 	} while (--i);
@@ -2853,6 +2974,7 @@ static inline void fsg_common_remove_sysfs(struct fsg_lun *lun)
 	 */
 	device_remove_file(&lun->dev, &dev_attr_ro);
 	device_remove_file(&lun->dev, &dev_attr_file);
+	device_remove_file(&lun->dev, &dev_attr_perf);
 }
 
 void fsg_common_remove_lun(struct fsg_lun *lun, bool sysfs)
@@ -2945,7 +3067,6 @@ int fsg_common_set_cdev(struct fsg_common *common,
 	common->ep0 = cdev->gadget->ep0;
 	common->ep0req = cdev->req;
 	common->cdev = cdev;
-	common->bicr = 0;
 
 	us = usb_gstrings_attach(cdev, fsg_strings_array,
 				 ARRAY_SIZE(fsg_strings));
@@ -2991,6 +3112,10 @@ static inline int fsg_common_add_sysfs(struct fsg_common *common,
 	rc = device_create_file(&lun->dev, &dev_attr_nofua);
 	if (rc)
 		goto error;
+
+	rc = device_create_file(&lun->dev, &dev_attr_perf);
+	if (rc)
+		pr_err("failed to create sysfs entry: %d\n", rc);
 
 	return 0;
 
@@ -3217,46 +3342,7 @@ remove_sysfs:
 
 	return ret;
 }
-
-ssize_t fsg_inquiry_show(struct fsg_common *common, char *buf)
-{
-	return snprintf(buf, PAGE_SIZE, "%s\n", common->inquiry_string);
-}
-ssize_t fsg_inquiry_store(struct fsg_common *common, const char *buf, size_t size)
-{
-	if (size >= sizeof(common->inquiry_string))
-		return -EINVAL;
-
-	if (sscanf(buf, "%28s", common->inquiry_string) != 1)
-		return -EINVAL;
-	return size;
-}
-
-ssize_t fsg_bicr_show(struct fsg_common *common, char *buf)
-{
-	return sprintf(buf, "%d\n", common->bicr);
-}
-ssize_t fsg_bicr_store(struct fsg_common *common, const char *buf, size_t size)
-{
-	int ret;
-
-	ret = kstrtou8(buf, 10, &common->bicr);
-	if (ret)
-		return -EINVAL;
-
-	/* Set Lun[0] is a CDROM when enable bicr.*/
-	if (!strcmp(buf, "1"))
-		common->luns[0]->cdrom = 1;
-	else {
-		common->luns[0]->cdrom = 0;
-		common->luns[0]->blkbits = 0;
-		common->luns[0]->blksize = 0;
-		common->luns[0]->num_sectors = 0;
-	}
-
-	return size;
-}
-
+EXPORT_SYMBOL(fsg_sysfs_update);
 
 /*-------------------------------------------------------------------------*/
 
@@ -3785,6 +3871,8 @@ static struct usb_function *fsg_alloc(struct usb_function_instance *fi)
 	fsg->function.free_func	= fsg_free;
 
 	fsg->common               = common;
+	setup_timer(&common->vfs_timer, msc_usb_vfs_timer_func,
+		(unsigned long) common);
 
 	return &fsg->function;
 }
@@ -3807,13 +3895,10 @@ void fsg_config_from_params(struct fsg_config *cfg,
 	cfg->nluns =
 		min(params->luns ?: (params->file_count ?: 1u),
 		    (unsigned)FSG_MAX_LUNS);
-
 	for (i = 0, lun = cfg->luns; i < cfg->nluns; ++i, ++lun) {
 		lun->ro = !!params->ro[i];
 		lun->cdrom = !!params->cdrom[i];
 		lun->removable = !!params->removable[i];
-		/* add nofua flag support */
-		lun->nofua = !!params->nofua[i];
 		lun->filename =
 			params->file_count > i && params->file[i][0]
 			? params->file[i]
