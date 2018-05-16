@@ -11,10 +11,10 @@
  * published by the Free Software Foundation.
  */
 
-#include <linux/usb/gadget.h>
 #include "u_f.h"
+#include <linux/usb/ch9.h>
 
-struct usb_request *alloc_ep_req(struct usb_ep *ep, int len, int default_len)
+struct usb_request *alloc_ep_req(struct usb_ep *ep, size_t len, int default_len)
 {
 	struct usb_request      *req;
 
@@ -24,6 +24,8 @@ struct usb_request *alloc_ep_req(struct usb_ep *ep, int len, int default_len)
 #if defined(CONFIG_64BIT) && defined(CONFIG_MTK_LM_MODE)
 		req->buf = kmalloc(req->length, GFP_ATOMIC | GFP_DMA);
 #else
+		if (usb_endpoint_dir_out(ep->desc))
+			req->length = usb_ep_align(ep, req->length);
 		req->buf = kmalloc(req->length, GFP_ATOMIC);
 #endif
 		if (!req->buf) {
